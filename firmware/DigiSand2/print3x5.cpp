@@ -143,6 +143,17 @@ static const uint8_t icons[][8] PROGMEM = {
         0b00111100,
         0b00011000  
     },
+    // 7 метроном
+    {
+        0b10000000,
+        0b11000000,
+        0b11100000,
+        0b11100011,
+        0b11101100,
+        0b11110000,
+        0b11000000,
+        0b10000000,
+    },
 };
 
 void printIcon(GyverGFX* mx, int X, int Y, uint8_t icon) {

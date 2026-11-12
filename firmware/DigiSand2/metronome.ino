@@ -1,0 +1,307 @@
+#include "pitches.h"
+
+// Метроном для занятий. Темп 40..208, размеры: выкл / 2/4 / 3/4 / 4/4 / 3/8 / 6/8.
+// Щелчок ставится по micros() и не ждёт перерисовку матрицы или физику песка.
+
+#define METRO_MIN 40
+#define METRO_MAX 208
+
+// 0 выкл, 1 = 2/4, 2 = 3/4, 3 = 4/4, 4 = 3/8, 5 = 6/8
+static const uint8_t METER_BEATS[] PROGMEM = {0, 2, 3, 4, 3, 6};
+static const uint8_t METER_CODE[] PROGMEM = {0, 2, 3, 4, 38, 68};
+
+static bool metroRunning = 0;
+static bool hitLeft = 0;
+static bool metroDirty = 0;
+static uint8_t metroBeat = 0;   // 0..n-1, доля, которая прозвучит следующей
+static uint8_t shownBeat = 0;   // 1..n, доля, которая звучит сейчас
+static uint8_t flashKind = 0;   // 0 обычная, 1 слабая (6/8), 2 сильная
+static uint16_t chirpFreq = 0;
+static uint16_t chirpDur = 0;
+static uint16_t intervalErr = 0;  // 60000000 % bpm, микросекунды, которые надо «размазать»
+static uint16_t errAcc = 0;
+static uint32_t intervalUs = 500000;
+static uint32_t nextUs = 0;
+static uint32_t beatStartUs = 0;
+static uint32_t chirpUs = 0;
+static uint32_t flashUntil = 0;
+static uint32_t metroDrawMs = 0;
+
+uint8_t metroBeats() {
+  uint8_t m = data.meter;
+  if (m > 5) return 0;
+  return pgm_read_byte(&METER_BEATS[m]);
+}
+
+uint8_t metroMeterCode() {
+  uint8_t m = data.meter;
+  if (m > 5) m = 0;
+  return pgm_read_byte(&METER_CODE[m]);
+}
+
+// интервал без накопления ошибки: за bpm долей проходит ровно 60 000 000 мкс
+static void metroApplyBpm() {
+  if (data.bpm < METRO_MIN || data.bpm > METRO_MAX) data.bpm = 80;
+  intervalUs = 60000000UL / data.bpm;
+  intervalErr = (uint16_t)(60000000UL % data.bpm);
+  errAcc = 0;
+}
+
+static void playTick(uint8_t kind) {
+  chirpUs = 0;
+  if (data.vol <= 0) return;
+  if (kind == 2) {
+    // сильная доля: громкий щелчок и следом более высокий — ритм, а не только высота
+    tone(SOUND_PIN, NOTE_C7, 14);
+    chirpFreq = NOTE_G7;
+    chirpDur = 18;
+    chirpUs = micros() + 24000UL;
+  } else if (kind == 1) {
+    tone(SOUND_PIN, NOTE_G7, 26);
+  } else {
+    tone(SOUND_PIN, NOTE_C7, 22);
+  }
+}
+
+static void metroFire(uint32_t scheduled, uint32_t now) {
+  uint8_t n = metroBeats();
+  uint8_t kind = 0;
+  if (n && metroBeat == 0) kind = 2;
+  else if (n == 6 && metroBeat == 3) kind = 1;  // 6/8: лёгкий акцент на 4-й восьмой
+
+  playTick(kind);
+  // маятник привязан к сетке доли, а не к дрожанию цикла; после большого опоздания — заново
+  if ((int32_t)(now - scheduled) > 20000) scheduled = now;
+  hitLeft = !hitLeft;
+  beatStartUs = scheduled;
+  flashKind = kind;
+  flashUntil = millis() + (kind == 2 ? 70 : 45);
+
+  if (n) {
+    shownBeat = metroBeat + 1;
+    metroBeat++;
+    if (metroBeat >= n) metroBeat = 0;
+  } else {
+    shownBeat = 0;
+  }
+  metroDirty = 1;
+}
+
+// true, если только что прозвучала доля
+bool metroPoll() {
+  uint32_t now = micros();
+  if (metroRunning && (int32_t)(now - nextUs) >= 0) {
+    chirpUs = 0;
+    metroFire(nextUs, now);
+    nextUs += intervalUs;
+    errAcc += intervalErr;
+    if (errAcc >= data.bpm) {
+      errAcc -= data.bpm;
+      nextUs++;
+    }
+    // если цикл опоздал больше чем на долю — не выдавать пачку щелчков
+    if ((int32_t)(now - nextUs) >= 0) {
+      nextUs = now + intervalUs;
+      errAcc = 0;
+    }
+    return true;
+  }
+  if (chirpUs && (int32_t)(now - chirpUs) >= 0) {
+    chirpUs = 0;
+    if (data.vol > 0) tone(SOUND_PIN, chirpFreq, chirpDur);
+  }
+  return false;
+}
+
+static uint8_t pendulumX() {
+  if (!metroRunning || !intervalUs) return 3;
+  uint32_t e = micros() - beatStartUs;
+  if (e > intervalUs) e = intervalUs;
+  uint8_t pos = (uint8_t)((e * 7UL) / intervalUs);
+  return hitLeft ? pos : (uint8_t)(7 - pos);
+}
+
+static uint8_t beatDotX(uint8_t i, uint8_t n) {
+  if (n == 2) return i ? 6 : 1;
+  if (n == 3) return i == 0 ? 1 : (i == 1 ? 4 : 6);
+  if (n == 6) return i < 3 ? i : (uint8_t)(i + 2);  // две группы по три: 6/8
+  return (uint8_t)(i * 2);                          // 4/4: 0,2,4,6
+}
+
+// три цифры на матрицу 8 пикселей: сотни — узкий столбец, остальное шрифт 3x5
+static void printBpm(uint8_t bpm) {
+  if (bpm < 100) {
+    printDig(&mtrx, 8, 1, bpm / 10);
+    printDig(&mtrx, 12, 1, bpm % 10);
+    return;
+  }
+  if (bpm < 200) {
+    for (uint8_t y = 1; y <= 5; y++) mtrx.dot(8, y);  // «1», как в шрифте
+  } else {
+    // «2» шириной в 2 столбца, только темпы 200..208
+    mtrx.dot(8, 1);
+    mtrx.dot(9, 1);
+    mtrx.dot(9, 2);
+    mtrx.dot(8, 3);
+    mtrx.dot(8, 4);
+    mtrx.dot(8, 5);
+    mtrx.dot(9, 5);
+  }
+  printDig(&mtrx, 10, 1, (bpm / 10) % 10);
+  printDig(&mtrx, 13, 1, bpm % 10);
+}
+
+static void drawMetro() {
+  mtrx.clear();
+  printBpm(data.bpm);
+
+  uint8_t n = metroBeats();
+  if (!metroRunning) {
+    // пауза
+    for (uint8_t y = 2; y <= 4; y++) {
+      mtrx.dot(2, y);
+      mtrx.dot(5, y);
+    }
+  } else if (n && shownBeat) {
+    printDig(&mtrx, 2, 1, shownBeat);
+  }
+
+  if (n) {
+    for (uint8_t i = 0; i < n; i++) {
+      if (!metroRunning || i < shownBeat) mtrx.dot(beatDotX(i, n), 0);
+    }
+  }
+
+  uint8_t px = pendulumX();
+  mtrx.dot(px, 6);
+  mtrx.dot(px, 7);
+  if (px > 0) mtrx.dot(px - 1, 7);
+  if (px < 7) mtrx.dot(px + 1, 7);
+
+  bool flashing = metroRunning && (int32_t)(millis() - flashUntil) < 0;
+  if (flashing) {
+    uint8_t edge = hitLeft ? 0 : 7;
+    uint8_t y0 = flashKind == 2 ? 0 : (flashKind == 1 ? 2 : 4);
+    mtrx.lineV(edge, y0, 7);
+    if (flashKind == 2) mtrx.lineH(7, 8, 15);
+    else {
+      mtrx.dot(11, 7);
+      mtrx.dot(12, 7);
+    }
+  }
+  mtrx.update();
+}
+
+static void redrawSand() {
+  mtrx.clear();
+  for (uint8_t y = 0; y < BOX_H; y++) {
+    for (uint8_t x = 0; x < BOX_W; x++) {
+      if (box.buf.get(x, y)) setXY(x, y, 1);
+    }
+  }
+  mtrx.update();
+}
+
+void changeMeter(int8_t dir) {
+  int8_t m = (int8_t)data.meter + dir;
+  if (m > 5) m = 0;
+  if (m < 0) m = 5;
+  data.meter = (uint8_t)m;
+  memory.update();
+}
+
+void changeBpm(int8_t dir) {
+  int16_t v = (int16_t)data.bpm + dir;
+  if (v < METRO_MIN) v = METRO_MIN;
+  if (v > METRO_MAX) v = METRO_MAX;
+  if ((uint8_t)v == data.bpm) return;
+  data.bpm = (uint8_t)v;
+  metroApplyBpm();
+  if (metroRunning) {
+    uint32_t now = micros();
+    // ускорение не должно ждать старый длинный интервал
+    if ((int32_t)(nextUs - now) > (int32_t)intervalUs) nextUs = now + intervalUs;
+  }
+  memory.update();
+  metroDirty = 1;
+}
+
+static void metroStart() {
+#ifdef SOUND_PIN
+  StopMelody();
+#endif
+  metroRunning = 1;
+  metroBeat = 0;
+  hitLeft = 0;
+  shownBeat = 0;
+  metroApplyBpm();
+  nextUs = micros();
+  metroPoll();  // сильная доля сразу, без ожидания кадра
+  metroDirty = 1;
+}
+
+static void metroStop() {
+  metroRunning = 0;
+  chirpUs = 0;
+  noTone(SOUND_PIN);
+  flashUntil = 0;
+  shownBeat = 0;
+  metroDirty = 1;
+}
+
+void enterMetro() {
+#ifdef SOUND_PIN
+  StopMelody();
+#endif
+  disp_tmr.stop();
+  inMenu = 0;
+  metroMode = 1;
+  metroRunning = 0;
+  chirpUs = 0;
+  shownBeat = 0;
+  flashUntil = 0;
+  noTone(SOUND_PIN);
+  metroApplyBpm();
+  drawMetro();
+}
+
+void exitMetro() {
+  metroStop();
+  metroMode = 0;
+  lastUsedMenu = 6;
+  menu_tmr.setTimeout(forgetLastMenu, 30000);
+  // песок стоял, пока играл метроном: не высыпать сразу пачку зёрен
+  fall_tmr.setInterval(data.sec * 1000ul / PART_AMOUNT);
+  redrawSand();
+}
+
+void metroButtons() {
+  if (dbl.hold()) {
+    exitMetro();
+    return;
+  }
+  if (dbl.click()) {
+    if (metroRunning) metroStop();
+    else metroStart();
+    return;
+  }
+  // те же жесты, что меняют секунды на часах: клик ±1, удержание ±10
+  if (up.click()) changeBpm(1);
+  if (up.step()) changeBpm(10);
+  if (up.hold()) changeBpm(10);
+  if (down.click()) changeBpm(-1);
+  if (down.step()) changeBpm(-10);
+  if (down.hold()) changeBpm(-10);
+}
+
+void metroService() {
+  bool beat = metroPoll();
+  uint32_t ms = millis();
+  bool anim = metroRunning && (uint32_t)(ms - metroDrawMs) >= 25;
+  if (!(beat || metroDirty || anim)) return;
+  metroDrawMs = ms;
+  metroDirty = 0;
+  drawMetro();
+  // доля могла наступить за время SPI — щелчок сразу, картинка следом
+  if (metroPoll()) drawMetro();
+}
