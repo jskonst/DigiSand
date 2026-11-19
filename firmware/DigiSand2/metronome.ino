@@ -251,7 +251,8 @@ void metroHalt() {
 }
 
 void drawMetroField() {
-  if (editField == 1) {
+  // 01 на поле вкл/выкл — тот же маятник, что на темпе. Отдельный шаг к полю темпа не нужен.
+  if (editField == 1 || (editField == 0 && metroRunning)) {
     drawMetro();
     return;
   }
@@ -264,6 +265,11 @@ void drawMetroField() {
     uint8_t code = metroMeterCode();
     printDig(&mtrx, 8, 1, code / 10);
     printDig(&mtrx, 12, 1, code % 10);
+    // размер при работающем метрономе: две точки, что щелчки и маятник уже идут
+    if (metroRunning && ((millis() / 400) & 1)) {
+      mtrx.dot(0, 0);
+      mtrx.dot(1, 0);
+    }
   }
   mtrx.update();
 }
@@ -299,8 +305,8 @@ void nudgeMetroEditor(int8_t dir) {
 }
 
 void serviceMetroEditor(bool beat) {
-  // поле темпа — прежний экран метронома: маятник, доля и BPM
-  if (editField == 1) {
+  // поле темпа и только что включённый метроном: маятник, доля и BPM
+  if (editField == 1 || (editField == 0 && metroRunning)) {
     uint32_t ms = millis();
     bool anim = metroRunning && (uint32_t)(ms - metroDrawMs) >= 25;
     if (!(beat || metroDirty || editorDirty || anim)) return;
@@ -310,6 +316,16 @@ void serviceMetroEditor(bool beat) {
     drawMetro();
     // доля могла наступить за время SPI — щелчок сразу, картинка следом
     if (metroPoll()) drawMetro();
+    return;
+  }
+  if (editField == 2 && metroRunning) {
+    static uint8_t hintPhase = 0xff;
+    uint8_t phase = (millis() / 400) & 1;
+    if (!editorDirty && !metroDirty && phase == hintPhase) return;
+    hintPhase = phase;
+    editorDirty = 0;
+    metroDirty = 0;
+    drawMetroField();
     return;
   }
   if (!editorDirty) return;

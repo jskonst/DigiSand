@@ -366,10 +366,14 @@ void showMenu(int8_t menu) {
       printDig(&mtrx, 8 + 4, 1, data.dual ? 1 : 0);
       break;
 
-    case MENU_METRO:  // метроном, снизу вкл/выкл
+    case MENU_METRO:  // метроном, снизу вкл/выкл. Включён — мигают две точки слева сверху.
       printIcon(&mtrx, 0, 0, 7);
       printDig(&mtrx, 8 + 0, 1, 0);
       printDig(&mtrx, 8 + 4, 1, data.metro ? 1 : 0);
+      if (data.metro && ((millis() / 400) & 1)) {
+        mtrx.dot(0, 0);
+        mtrx.dot(1, 0);
+      }
       break;
   }
   mtrx.update();
@@ -630,6 +634,17 @@ void loop() {
   if (editKind) {
     serviceDualEditor();
     return;
+  }
+
+  // список меню не крутит маятник; мигание только показывает, что метроном включён
+  if (inMenu == MENU_METRO && data.metro) {
+    static uint8_t hintPhase = 0xff;
+    uint8_t phase = (millis() / 400) & 1;
+    if (phase != hintPhase) {
+      hintPhase = phase;
+      mtrx.clear();
+      showMenu(MENU_METRO);
+    }
   }
 
   if (!disp_tmr.state()) {
