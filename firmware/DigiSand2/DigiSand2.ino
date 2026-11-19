@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <stddef.h>
 
 #include "print3x5.h"
 
@@ -25,8 +26,15 @@ struct Data {
   int8_t ani = 0;    // анимации окончания времени
   int8_t tmpo = 4;   // темп проигрывания мелодий
   int8_t bat = 1;
+  uint8_t bpm = 80;   // метроном, 40..208 (дописано в конец, старые настройки не сдвигаются)
+  uint8_t meter = 3;  // 0 выкл, 1 = 2/4, 2 = 3/4, 3 = 4/4, 4 = 3/8, 5 = 6/8
 };
 Data data;
+
+// v1.3 занимала 8 байт; новые поля только в хвосте, ключ EEPROM не меняем
+static_assert(offsetof(Data, bpm) == 8, "bpm must stay appended after v1.3 settings");
+static_assert(offsetof(Data, meter) == 9, "meter must follow bpm");
+static_assert(sizeof(Data) == 10, "no padding in settings block");
 
 #include <EEManager.h>
 EEManager memory(data);
@@ -53,7 +61,7 @@ Mini6050 mpu;
 Sand<BOX_W, BOX_H> box;
 
 // timer
-#include "Timer.h"
+#include "timer.h"
 Timer fall_tmr, disp_tmr, menu_tmr;
 
 // ============== ВАШ КОД ==============
@@ -99,6 +107,7 @@ void onBatteryEmpty() {
 }
 
 uint8_t inMenu = 0;
+bool metroMode = 0;
 uint8_t lastUsedMenu = 0;    // последнее использованное меню
 unsigned long voltage;       // напряжение аккумулятора
 float my_vcc_const = 1.080;  // константа вольтметра
@@ -135,6 +144,12 @@ void setup() {
   Wire.begin();
   mpu.begin();
   memory.begin(0, 'a');
+  // старая прошивка не писала хвост блока: в EEPROM там 0xFF, подставляем дефолт
+  if (data.bpm < 40 || data.bpm > 208 || data.meter > 5) {
+    if (data.bpm < 40 || data.bpm > 208) data.bpm = 80;
+    if (data.meter > 5) data.meter = 3;
+    memory.update();
+  }
   mtrx.begin();
   mtrx.setBright(data.bri);
 
@@ -230,8 +245,8 @@ void enterMenu(int8_t menu) {
   mtrx.clear();
 
   // здесь настраивается число доступных пунктов меню
-  if (menu > 5) menu = 1;
-  if (menu < 1) menu = 5;
+  if (menu > 6) menu = 1;
+  if (menu < 1) menu = 6;
 
   inMenu = menu;
   menu_tmr.setTimeout(forgetLastMenu, 30000);
@@ -277,10 +292,13 @@ void showMenu(int8_t menu) {
       printDig(&mtrx, 8 + 4, 1, data.bat % 10);
       break;
 
-    case 6:  // анимации
-      printIcon(&mtrx, 0, 0, 3);
-      printDig(&mtrx, 8 + 0, 1, data.ani / 10);
-      printDig(&mtrx, 8 + 4, 1, data.ani % 10);
+    case 6:  // метроном, снизу код размера
+      printIcon(&mtrx, 0, 0, 7);
+      {
+        uint8_t code = metroMeterCode();
+        printDig(&mtrx, 8 + 0, 1, code / 10);
+        printDig(&mtrx, 8 + 4, 1, code % 10);
+      }
       break;
   }
   mtrx.update();
@@ -335,12 +353,8 @@ void changeMenuParam(int8_t menu, int8_t val) {
       changeBat(val);
       break;
 
-    case 6:  // анимация окончания
-      changeAni(val);
-      // todo
-      // Варианты:
-      // - мигание песка (вкл/выкл)
-      // - плавное мигание песка (игра с яркостью)
+    case 6:  // размер метронома
+      changeMeter(val);
       break;
   }
   showMenu(menu);
@@ -358,6 +372,11 @@ void buttons() {
   down.tick();
   dbl.tick(up, down);
 
+  if (metroMode) {
+    metroButtons();
+    return;
+  }
+
   if (!inMenu) {
     if (dbl.hold()) enterMenu(lastUsedMenu ? lastUsedMenu : 1);
     if (dbl.click()) resetSand();
@@ -372,7 +391,11 @@ void buttons() {
     if (down.step()) changeTime(-10);
     if (down.hold()) changeTime(-10);
   } else {
-    if (dbl.click()) returnFromMenu();
+    // на пункте метронома обе кнопки входят в режим, на остальных — выход, как раньше
+    if (dbl.click()) {
+      if (inMenu == 6) enterMetro();
+      else returnFromMenu();
+    }
     if (up.hold()) enterMenu(inMenu + 1);
     if (down.hold()) enterMenu(inMenu - 1);
     if (up.click()) changeMenuParam(inMenu, 1);
@@ -426,12 +449,20 @@ void fall() {
 
 // Главный цикл
 void loop() {
+  // щелчок метронома раньше песка, меню и перерисовки матрицы
+  if (metroMode) metroPoll();
+
   memory.tick();
   disp_tmr.tick();
 #ifdef SOUND_PIN
-  soundsTick();
+  if (!metroMode) soundsTick();
 #endif
   buttons();
+
+  if (metroMode) {
+    metroService();
+    return;
+  }
 
   if (!disp_tmr.state()) {
     step();
