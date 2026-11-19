@@ -192,21 +192,14 @@ static void drawMetro() {
   mtrx.update();
 }
 
-static void redrawSand() {
-  mtrx.clear();
-  for (uint8_t y = 0; y < BOX_H; y++) {
-    for (uint8_t x = 0; x < BOX_W; x++) {
-      if (box.buf.get(x, y)) setXY(x, y, 1);
-    }
-  }
-  mtrx.update();
-}
-
 void changeMeter(int8_t dir) {
   int8_t m = (int8_t)data.meter + dir;
   if (m > 5) m = 0;
   if (m < 0) m = 5;
   data.meter = (uint8_t)m;
+  metroBeat = 0;
+  shownBeat = 0;
+  metroDirty = 1;
   memory.update();
 }
 
@@ -249,59 +242,78 @@ static void metroStop() {
   metroDirty = 1;
 }
 
-void enterMetro() {
-#ifdef SOUND_PIN
-  StopMelody();
-#endif
-  disp_tmr.stop();
-  inMenu = 0;
-  metroMode = 1;
-  metroRunning = 0;
-  chirpUs = 0;
-  shownBeat = 0;
-  flashUntil = 0;
-  noTone(SOUND_PIN);
-  metroApplyBpm();
-  drawMetro();
+void metroHalt() {
+  if (metroRunning) metroStop();
+  else {
+    chirpUs = 0;
+    noTone(SOUND_PIN);
+  }
 }
 
-void exitMetro() {
-  metroStop();
-  metroMode = 0;
-  lastUsedMenu = 6;
-  menu_tmr.setTimeout(forgetLastMenu, 30000);
-  // песок стоял, пока играл метроном: не высыпать сразу пачку зёрен
-  fall_tmr.setInterval(data.sec * 1000ul / PART_AMOUNT);
-  redrawSand();
-}
-
-void metroButtons() {
-  if (dbl.hold()) {
-    exitMetro();
+void drawMetroField() {
+  if (editField == 1) {
+    drawMetro();
     return;
   }
-  if (dbl.click()) {
-    if (metroRunning) metroStop();
-    else metroStart();
-    return;
+  mtrx.clear();
+  printIcon(&mtrx, 0, 0, 7);
+  if (editField == 0) {
+    printDig(&mtrx, 8, 1, 0);
+    printDig(&mtrx, 12, 1, data.metro ? 1 : 0);
+  } else {
+    uint8_t code = metroMeterCode();
+    printDig(&mtrx, 8, 1, code / 10);
+    printDig(&mtrx, 12, 1, code % 10);
   }
-  // те же жесты, что меняют секунды на часах: клик ±1, удержание ±10
-  if (up.click()) changeBpm(1);
-  if (up.step()) changeBpm(10);
-  if (up.hold()) changeBpm(10);
-  if (down.click()) changeBpm(-1);
-  if (down.step()) changeBpm(-10);
-  if (down.hold()) changeBpm(-10);
+  mtrx.update();
 }
 
-void metroService() {
-  bool beat = metroPoll();
-  uint32_t ms = millis();
-  bool anim = metroRunning && (uint32_t)(ms - metroDrawMs) >= 25;
-  if (!(beat || metroDirty || anim)) return;
-  metroDrawMs = ms;
+void enterMetroEdit() {
+  beginEditor(2, MENU_METRO);
+  if (data.metro) metroStart();
+  else metroHalt();
   metroDirty = 0;
-  drawMetro();
-  // доля могла наступить за время SPI — щелчок сразу, картинка следом
-  if (metroPoll()) drawMetro();
+  drawMetroField();
+}
+
+// dir = ±1 с клика или ±10 с удержания. Размер и вкл/выкл шагают на 1.
+void nudgeMetroEditor(int8_t dir) {
+  int8_t step = dir > 0 ? 1 : -1;
+  if (editField == 0) {
+    int8_t v = (int8_t)data.metro + step;
+    if (v < 0) v = 0;
+    if (v > 1) v = 1;
+    data.metro = (uint8_t)v;
+    memory.update();
+    if (data.metro) {
+      if (!metroRunning) metroStart();
+    } else if (metroRunning) {
+      metroStop();
+    }
+  } else if (editField == 1) {
+    changeBpm(dir);
+  } else {
+    changeMeter(step);
+  }
+  editorDirty = 1;
+}
+
+void serviceMetroEditor(bool beat) {
+  // поле темпа — прежний экран метронома: маятник, доля и BPM
+  if (editField == 1) {
+    uint32_t ms = millis();
+    bool anim = metroRunning && (uint32_t)(ms - metroDrawMs) >= 25;
+    if (!(beat || metroDirty || editorDirty || anim)) return;
+    metroDrawMs = ms;
+    metroDirty = 0;
+    editorDirty = 0;
+    drawMetro();
+    // доля могла наступить за время SPI — щелчок сразу, картинка следом
+    if (metroPoll()) drawMetro();
+    return;
+  }
+  if (!editorDirty) return;
+  editorDirty = 0;
+  metroDirty = 0;
+  drawMetroField();
 }

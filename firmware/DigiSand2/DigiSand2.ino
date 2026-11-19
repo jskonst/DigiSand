@@ -17,24 +17,32 @@
 #define battery_min 3000  // минимальный уровень заряда батареи для отображения 3000
 #define battery_max 3800  // максимальный уровень заряда батареи для отображения  3800
 
-// Структура конфигурации для хранения в EEPROM
+// Структура конфигурации для хранения в EEPROM.
+// Хвост только дописывается: ключ 'a' тот же, яркость и мелодии со старых прошивок не сдвигаются.
 struct Data {
-  int16_t sec = 60;  // время
+  int16_t sec = 60;  // время стороны A, секунды. Если dual == 0 — единственное время
   int8_t bri = 2;    // яркость
   int8_t vol = 1;    // громкость эффектов
   int8_t mel = 1;    // мелодия окончания времени
   int8_t ani = 0;    // анимации окончания времени
   int8_t tmpo = 4;   // темп проигрывания мелодий
   int8_t bat = 1;
-  uint8_t bpm = 80;   // метроном, 40..208 (дописано в конец, старые настройки не сдвигаются)
-  uint8_t meter = 3;  // 0 выкл, 1 = 2/4, 2 = 3/4, 3 = 4/4, 4 = 3/8, 5 = 6/8
+  uint8_t bpm = 80;   // метроном, 40..208
+  uint8_t meter = 3;  // 0 без акцента, 1 = 2/4, 2 = 3/4, 3 = 4/4, 4 = 3/8, 5 = 6/8
+  int16_t secB = 60;  // время стороны B, секунды
+  uint8_t dual = 0;   // 0 одно время на обе стороны, 1 у каждой своё
+  uint8_t metro = 0;  // 0 метроном выключен, 1 включен
 };
 Data data;
 
-// v1.3 занимала 8 байт; новые поля только в хвосте, ключ EEPROM не меняем
+// v1.3 — 8 байт, v1.4 дописала bpm и meter, v1.5 — secB, dual, metro.
+// Стёртый EEPROM в хвосте равен 0xFF; это ловим при старте и подставляем значения по умолчанию.
 static_assert(offsetof(Data, bpm) == 8, "bpm must stay appended after v1.3 settings");
 static_assert(offsetof(Data, meter) == 9, "meter must follow bpm");
-static_assert(sizeof(Data) == 10, "no padding in settings block");
+static_assert(offsetof(Data, secB) == 10, "secB appended after meter");
+static_assert(offsetof(Data, dual) == 12, "dual follows secB");
+static_assert(offsetof(Data, metro) == 13, "metro follows dual");
+static_assert(sizeof(Data) == 14, "no padding in settings block");
 
 #include <EEManager.h>
 EEManager memory(data);
@@ -106,9 +114,17 @@ void onBatteryEmpty() {
   }
 }
 
+#define MENU_COUNT 7
+#define MENU_DUAL 6
+#define MENU_METRO 7
+
 uint8_t inMenu = 0;
-bool metroMode = 0;
 uint8_t lastUsedMenu = 0;    // последнее использованное меню
+int8_t fallDir = 1;          // >0 сверху сторона A (песок уходит из колбы 7,7), иначе сторона B
+uint8_t editKind = 0;        // 0 нет, 1 экран двух времён, 2 экран метронома
+uint8_t editField = 0;
+uint8_t editMenu = 1;
+bool editorDirty = 0;
 unsigned long voltage;       // напряжение аккумулятора
 float my_vcc_const = 1.080;  // константа вольтметра
 
@@ -145,11 +161,28 @@ void setup() {
   mpu.begin();
   memory.begin(0, 'a');
   // старая прошивка не писала хвост блока: в EEPROM там 0xFF, подставляем дефолт
-  if (data.bpm < 40 || data.bpm > 208 || data.meter > 5) {
-    if (data.bpm < 40 || data.bpm > 208) data.bpm = 80;
-    if (data.meter > 5) data.meter = 3;
-    memory.update();
+  bool fixSettings = 0;
+  if (data.bpm < 40 || data.bpm > 208) {
+    data.bpm = 80;
+    fixSettings = 1;
   }
+  if (data.meter > 5) {
+    data.meter = 3;
+    fixSettings = 1;
+  }
+  if (data.secB < 0) {  // 0xFFFF со стёртого хвоста; 0 секунд — допустимое время
+    data.secB = data.sec < 0 ? 60 : data.sec;
+    fixSettings = 1;
+  }
+  if (data.dual > 1) {
+    data.dual = 0;
+    fixSettings = 1;
+  }
+  if (data.metro > 1) {
+    data.metro = 0;
+    fixSettings = 1;
+  }
+  if (fixSettings) memory.update();
   mtrx.begin();
   mtrx.setBright(data.bri);
 
@@ -172,25 +205,60 @@ void setup() {
   delay(2000);  // время отображения заряда после включения
 
   resetSand();
-  fall_tmr.setInterval(data.sec * 1000ul / PART_AMOUNT);
+  mpu.update(0);
+  fallDir = mpu.getDir();
+  applyFallInterval();
+}
+
+// Верхняя сторона — та, из которой сейчас сыплется песок (см. fall()).
+int16_t* upperTime() {
+  if (data.dual && fallDir <= 0) return &data.secB;
+  return &data.sec;
+}
+
+void applyFallInterval() {
+  int16_t sec = *upperTime();
+  if (sec < 0) sec = 0;
+  fall_tmr.setInterval((uint32_t)sec * 1000ul / PART_AMOUNT);
+}
+
+void trackSide() {
+  int8_t dir = mpu.getDir();
+  if (dir == fallDir) return;
+  fallDir = dir;
+  if (data.dual) applyFallInterval();
+}
+
+// side < 0 — обычные часы без буквы, цифры на прежнем месте.
+// side 0/1 — время A/B, буква под минутами и под секундами.
+void showClock(int16_t sec, int8_t side) {
+  if (sec < 0) sec = 0;
+  uint8_t min = (uint8_t)(sec / 60);
+  uint8_t s = (uint8_t)(sec % 60);
+  int8_t y = side < 0 ? 1 : 0;
+  mtrx.clear();
+  printDig(&mtrx, 0, y, min / 10);
+  printDig(&mtrx, 4, y, min % 10);
+  printDig(&mtrx, 8, y, s / 10);
+  printDig(&mtrx, 12, y, s % 10);
+  if (side >= 0) {
+    printSide(&mtrx, 2, 5, (uint8_t)side);
+    printSide(&mtrx, 10, 5, (uint8_t)side);
+  }
+  mtrx.update();
 }
 
 void changeTime(int8_t dir) {
   disp_tmr.setTimeout(3000);
-  mtrx.clear();
-  data.sec += dir;
-  if (data.sec < 0) data.sec = 0;
-  uint8_t min = data.sec / 60;
-  uint8_t sec = data.sec % 60;
-
-  printDig(&mtrx, 0, 1, min / 10);
-  printDig(&mtrx, 4, 1, min % 10);
-  printDig(&mtrx, 8 + 0, 1, sec / 10);
-  printDig(&mtrx, 8 + 4, 1, sec % 10);
-
-  fall_tmr.setInterval(data.sec * 1000ul / PART_AMOUNT);
+  if (data.dual && mpu.update(0)) fallDir = mpu.getDir();
+  int16_t* sec = upperTime();
+  int32_t v = (int32_t)(*sec) + dir;
+  if (v < 0) v = 0;
+  if (v > 32767) v = 32767;
+  *sec = (int16_t)v;
+  showClock(*sec, data.dual ? (fallDir <= 0 ? 1 : 0) : -1);
+  applyFallInterval();
   memory.update();
-  mtrx.update();
 }
 
 // изменение темпа
@@ -245,8 +313,8 @@ void enterMenu(int8_t menu) {
   mtrx.clear();
 
   // здесь настраивается число доступных пунктов меню
-  if (menu > 6) menu = 1;
-  if (menu < 1) menu = 6;
+  if (menu > MENU_COUNT) menu = 1;
+  if (menu < 1) menu = MENU_COUNT;
 
   inMenu = menu;
   menu_tmr.setTimeout(forgetLastMenu, 30000);
@@ -292,13 +360,16 @@ void showMenu(int8_t menu) {
       printDig(&mtrx, 8 + 4, 1, data.bat % 10);
       break;
 
-    case 6:  // метроном, снизу код размера
+    case MENU_DUAL:  // два времени, снизу вкл/выкл
+      printIcon(&mtrx, 0, 0, 8);
+      printDig(&mtrx, 8 + 0, 1, 0);
+      printDig(&mtrx, 8 + 4, 1, data.dual ? 1 : 0);
+      break;
+
+    case MENU_METRO:  // метроном, снизу вкл/выкл
       printIcon(&mtrx, 0, 0, 7);
-      {
-        uint8_t code = metroMeterCode();
-        printDig(&mtrx, 8 + 0, 1, code / 10);
-        printDig(&mtrx, 8 + 4, 1, code % 10);
-      }
+      printDig(&mtrx, 8 + 0, 1, 0);
+      printDig(&mtrx, 8 + 4, 1, data.metro ? 1 : 0);
       break;
   }
   mtrx.update();
@@ -352,10 +423,6 @@ void changeMenuParam(int8_t menu, int8_t val) {
     case 5:  // отображение заряда
       changeBat(val);
       break;
-
-    case 6:  // размер метронома
-      changeMeter(val);
-      break;
   }
   showMenu(menu);
 }
@@ -366,14 +433,105 @@ void returnFromMenu() {
   inMenu = 0;
 }
 
+void showIconNum(uint8_t icon, uint8_t val) {
+  mtrx.clear();
+  printIcon(&mtrx, 0, 0, icon);
+  printDig(&mtrx, 8, 1, val / 10);
+  printDig(&mtrx, 12, 1, val % 10);
+  mtrx.update();
+}
+
+void drawDualEditor() {
+  if (editField == 0) showIconNum(8, data.dual ? 1 : 0);
+  else showClock(editField == 1 ? data.sec : data.secB, editField == 1 ? 0 : 1);
+}
+
+void nudgeDualEditor(int8_t dir) {
+  if (editField == 0) {
+    int8_t v = (int8_t)data.dual + (dir > 0 ? 1 : -1);
+    if (v < 0) v = 0;
+    if (v > 1) v = 1;
+    data.dual = (uint8_t)v;
+    if (mpu.update(0)) fallDir = mpu.getDir();
+    applyFallInterval();
+  } else {
+    int16_t* sec = (editField == 1) ? &data.sec : &data.secB;
+    int32_t v = (int32_t)(*sec) + dir;
+    if (v < 0) v = 0;
+    if (v > 32767) v = 32767;
+    *sec = (int16_t)v;
+    // песок в редакторе стоит; интервал обновится при выходе
+  }
+  memory.update();
+  editorDirty = 1;
+}
+
+void beginEditor(uint8_t kind, uint8_t menu) {
+#ifdef SOUND_PIN
+  StopMelody();
+#endif
+  disp_tmr.stop();  // пока правим поля, меню само не закрывается
+  inMenu = 0;
+  editKind = kind;
+  editField = 0;
+  editMenu = menu;
+  editorDirty = 0;
+}
+
+void enterDualEdit() {
+  beginEditor(1, MENU_DUAL);
+  if (mpu.update(0)) fallDir = mpu.getDir();
+  drawDualEditor();
+}
+
+void exitEditor() {
+  metroHalt();
+  uint8_t back = editMenu ? editMenu : 1;
+  editKind = 0;
+  editField = 0;
+  editorDirty = 0;
+  if (mpu.update(0)) fallDir = mpu.getDir();
+  applyFallInterval();
+  enterMenu(back);
+}
+
+void serviceDualEditor() {
+  if (!editorDirty) return;
+  editorDirty = 0;
+  drawDualEditor();
+}
+
+void nudgeEditor(int8_t dir) {
+  if (editKind == 2) nudgeMetroEditor(dir);
+  else nudgeDualEditor(dir);
+}
+
+void editorButtons() {
+  if (dbl.hold()) {
+    exitEditor();
+    return;
+  }
+  if (dbl.click()) {
+    editField++;
+    if (editField > 2) editField = 0;
+    editorDirty = 1;
+    return;
+  }
+  // как на часах: клик ±1, удержание ±10. На вкл/выкл и размере шаг всё равно 1
+  if (up.click()) nudgeEditor(1);
+  else if (up.hold() || up.step()) nudgeEditor(10);
+  if (down.click()) nudgeEditor(-1);
+  else if (down.hold() || down.step()) nudgeEditor(-10);
+}
+
 // обработчик кнопок
 void buttons() {
   up.tick();
   down.tick();
   dbl.tick(up, down);
 
-  if (metroMode) {
-    metroButtons();
+  if (editKind) {
+    editorButtons();
     return;
   }
 
@@ -391,11 +549,15 @@ void buttons() {
     if (down.step()) changeTime(-10);
     if (down.hold()) changeTime(-10);
   } else {
-    // на пункте метронома обе кнопки входят в режим, на остальных — выход, как раньше
-    if (dbl.click()) {
-      if (inMenu == 6) enterMetro();
-      else returnFromMenu();
+    // два времени и метроном открываются в свой экран; клик одной кнопки тоже входит.
+    // На остальных пунктах обе кнопки по-прежнему закрывают меню.
+    bool openEditor = inMenu == MENU_DUAL || inMenu == MENU_METRO;
+    if (openEditor && (dbl.click() || up.click() || down.click())) {
+      if (inMenu == MENU_DUAL) enterDualEdit();
+      else enterMetroEdit();
+      return;
     }
+    if (dbl.click()) returnFromMenu();
     if (up.hold()) enterMenu(inMenu + 1);
     if (down.hold()) enterMenu(inMenu - 1);
     if (up.click()) changeMenuParam(inMenu, 1);
@@ -407,6 +569,7 @@ void step() {
   uint16_t prd = 255 - mpu.getMag();
   prd = constrain(prd, 15, 90);
   if (mpu.update(prd)) {
+    trackSide();
     mtrx.clear();
     box.step(mpu.getAngle() + 45);
     mtrx.update();
@@ -449,18 +612,23 @@ void fall() {
 
 // Главный цикл
 void loop() {
-  // щелчок метронома раньше песка, меню и перерисовки матрицы
-  if (metroMode) metroPoll();
+  // щелчок раньше перерисовки, только пока открыт экран метронома
+  bool beat = 0;
+  if (editKind == 2) beat = metroPoll();
 
   memory.tick();
   disp_tmr.tick();
 #ifdef SOUND_PIN
-  if (!metroMode) soundsTick();
+  if (editKind != 2) soundsTick();
 #endif
   buttons();
 
-  if (metroMode) {
-    metroService();
+  if (editKind == 2) {
+    serviceMetroEditor(beat);
+    return;
+  }
+  if (editKind) {
+    serviceDualEditor();
     return;
   }
 
