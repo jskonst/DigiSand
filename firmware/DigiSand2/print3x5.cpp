@@ -154,7 +154,42 @@ static const uint8_t icons[][8] PROGMEM = {
         0b11000000,
         0b10000000,
     },
+    // 8 два времени: верхняя колба полная, нижняя пустая
+    // y0 .######.
+    // y1 .######.
+    // y2 .##..##.
+    // y3 ...##...
+    // y4 ...##...
+    // y5 ..#..#..
+    // y6 .#....#.
+    // y7 .######.
+    {
+        0b00000000,
+        0b11000111,
+        0b10100111,
+        0b10011011,
+        0b10011011,
+        0b10100111,
+        0b11000111,
+        0b00000000,
+    },
 };
+
+// A: .###. / #...# / #####    B: ####. / #.#.# / ####.
+static const uint8_t sideMark[][5] PROGMEM = {
+    {0b110, 0b101, 0b101, 0b101, 0b110},
+    {0b111, 0b101, 0b111, 0b101, 0b010},
+};
+
+void printSide(GyverGFX* mx, int X, int Y, uint8_t side) {
+    if (side > 1) side = 0;
+    for (uint8_t x = 0; x < 5; x++) {
+        uint8_t col = pgm_read_byte(&sideMark[side][x]);
+        for (uint8_t y = 0; y < 3; y++) {
+            if (bitRead(col, y)) mx->dot(X + x, Y + y);
+        }
+    }
+}
 
 void printIcon(GyverGFX* mx, int X, int Y, uint8_t icon) {
     for (uint8_t x = 0; x < 8; x++) {
