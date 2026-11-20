@@ -1,21 +1,25 @@
 #include "pitches.h"
 
-// Метроном для занятий. Темп 40..208, размеры: выкл / 2/4 / 3/4 / 4/4 / 3/8 / 6/8.
+// Метроном для занятий. Темп 40..208.
+// Размеры по кругу: выкл / 2/4 / 3/4 / 4/4 / 3/8 / 6/8 / 8/4.
 // Щелчок ставится по micros() и не ждёт перерисовку матрицы или физику песка.
 
 #define METRO_MIN 40
 #define METRO_MAX 208
 
-// 0 выкл, 1 = 2/4, 2 = 3/4, 3 = 4/4, 4 = 3/8, 5 = 6/8
-static const uint8_t METER_BEATS[] PROGMEM = {0, 2, 3, 4, 3, 6};
-static const uint8_t METER_CODE[] PROGMEM = {0, 2, 3, 4, 38, 68};
+// Индекс в EEPROM не сдвигается: новый размер только в конец.
+// 0 выкл, 1 = 2/4, 2 = 3/4, 3 = 4/4, 4 = 3/8, 5 = 6/8, 6 = 8/4
+static const uint8_t METER_BEATS[] PROGMEM = {0, 2, 3, 4, 3, 6, 8};
+static const uint8_t METER_CODE[] PROGMEM = {0, 2, 3, 4, 38, 68, 84};
+static const uint8_t METER_COUNT = sizeof(METER_BEATS);
+static_assert(sizeof(METER_BEATS) == sizeof(METER_CODE), "meter tables differ");
 
 static bool metroRunning = 0;
 static bool hitLeft = 0;
 static bool metroDirty = 0;
 static uint8_t metroBeat = 0;   // 0..n-1, доля, которая прозвучит следующей
 static uint8_t shownBeat = 0;   // 1..n, доля, которая звучит сейчас
-static uint8_t flashKind = 0;   // 0 обычная, 1 слабая (6/8), 2 сильная
+static uint8_t flashKind = 0;   // 0 обычная, 1 слабая (середина 6/8 и 8/4), 2 сильная
 static uint16_t chirpFreq = 0;
 static uint16_t chirpDur = 0;
 static uint16_t intervalErr = 0;  // 60000000 % bpm, микросекунды, которые надо «размазать»
@@ -27,15 +31,19 @@ static uint32_t chirpUs = 0;
 static uint32_t flashUntil = 0;
 static uint32_t metroDrawMs = 0;
 
+uint8_t metroMeterCount() {
+  return METER_COUNT;
+}
+
 uint8_t metroBeats() {
   uint8_t m = data.meter;
-  if (m > 5) return 0;
+  if (m >= METER_COUNT) return 0;
   return pgm_read_byte(&METER_BEATS[m]);
 }
 
 uint8_t metroMeterCode() {
   uint8_t m = data.meter;
-  if (m > 5) m = 0;
+  if (m >= METER_COUNT) m = 0;
   return pgm_read_byte(&METER_CODE[m]);
 }
 
@@ -67,7 +75,8 @@ static void metroFire(uint32_t scheduled, uint32_t now) {
   uint8_t n = metroBeats();
   uint8_t kind = 0;
   if (n && metroBeat == 0) kind = 2;
-  else if (n == 6 && metroBeat == 3) kind = 1;  // 6/8: лёгкий акцент на 4-й восьмой
+  // Середина чётного такта от 6 долей: 6/8 — 4-я, 8/4 — 5-я. 2/4 и 4/4 без второго акцента.
+  else if (n >= 6 && metroBeat * 2 == n) kind = 1;
 
   playTick(kind);
   // маятник привязан к сетке доли, а не к дрожанию цикла; после большого опоздания — заново
@@ -125,6 +134,7 @@ static uint8_t beatDotX(uint8_t i, uint8_t n) {
   if (n == 2) return i ? 6 : 1;
   if (n == 3) return i == 0 ? 1 : (i == 1 ? 4 : 6);
   if (n == 6) return i < 3 ? i : (uint8_t)(i + 2);  // две группы по три: 6/8
+  if (n == 8) return i;                             // 8/4: вся верхняя строка, x = 0..7
   return (uint8_t)(i * 2);                          // 4/4: 0,2,4,6
 }
 
@@ -194,8 +204,8 @@ static void drawMetro() {
 
 void changeMeter(int8_t dir) {
   int8_t m = (int8_t)data.meter + dir;
-  if (m > 5) m = 0;
-  if (m < 0) m = 5;
+  if (m >= (int8_t)METER_COUNT) m = 0;
+  if (m < 0) m = (int8_t)METER_COUNT - 1;
   data.meter = (uint8_t)m;
   metroBeat = 0;
   shownBeat = 0;
@@ -251,7 +261,8 @@ void metroHalt() {
 }
 
 void drawMetroField() {
-  if (editField == 1) {
+  // 01 на поле вкл/выкл — тот же маятник, что на темпе. Отдельный шаг к полю темпа не нужен.
+  if (editField == 1 || (editField == 0 && metroRunning)) {
     drawMetro();
     return;
   }
@@ -264,6 +275,11 @@ void drawMetroField() {
     uint8_t code = metroMeterCode();
     printDig(&mtrx, 8, 1, code / 10);
     printDig(&mtrx, 12, 1, code % 10);
+    // размер при работающем метрономе: две точки, что щелчки и маятник уже идут
+    if (metroRunning && ((millis() / 400) & 1)) {
+      mtrx.dot(0, 0);
+      mtrx.dot(1, 0);
+    }
   }
   mtrx.update();
 }
@@ -299,8 +315,8 @@ void nudgeMetroEditor(int8_t dir) {
 }
 
 void serviceMetroEditor(bool beat) {
-  // поле темпа — прежний экран метронома: маятник, доля и BPM
-  if (editField == 1) {
+  // поле темпа и только что включённый метроном: маятник, доля и BPM
+  if (editField == 1 || (editField == 0 && metroRunning)) {
     uint32_t ms = millis();
     bool anim = metroRunning && (uint32_t)(ms - metroDrawMs) >= 25;
     if (!(beat || metroDirty || editorDirty || anim)) return;
@@ -310,6 +326,16 @@ void serviceMetroEditor(bool beat) {
     drawMetro();
     // доля могла наступить за время SPI — щелчок сразу, картинка следом
     if (metroPoll()) drawMetro();
+    return;
+  }
+  if (editField == 2 && metroRunning) {
+    static uint8_t hintPhase = 0xff;
+    uint8_t phase = (millis() / 400) & 1;
+    if (!editorDirty && !metroDirty && phase == hintPhase) return;
+    hintPhase = phase;
+    editorDirty = 0;
+    metroDirty = 0;
+    drawMetroField();
     return;
   }
   if (!editorDirty) return;

@@ -28,7 +28,7 @@ struct Data {
   int8_t tmpo = 4;   // темп проигрывания мелодий
   int8_t bat = 1;
   uint8_t bpm = 80;   // метроном, 40..208
-  uint8_t meter = 3;  // 0 без акцента, 1 = 2/4, 2 = 3/4, 3 = 4/4, 4 = 3/8, 5 = 6/8
+  uint8_t meter = 3;  // 0 без акцента, 1 = 2/4, 2 = 3/4, 3 = 4/4, 4 = 3/8, 5 = 6/8, 6 = 8/4
   int16_t secB = 60;  // время стороны B, секунды
   uint8_t dual = 0;   // 0 одно время на обе стороны, 1 у каждой своё
   uint8_t metro = 0;  // 0 метроном выключен, 1 включен
@@ -166,7 +166,7 @@ void setup() {
     data.bpm = 80;
     fixSettings = 1;
   }
-  if (data.meter > 5) {
+  if (data.meter >= metroMeterCount()) {  // 0xFF со стёртого хвоста; 0..6 — известные размеры
     data.meter = 3;
     fixSettings = 1;
   }
@@ -366,10 +366,14 @@ void showMenu(int8_t menu) {
       printDig(&mtrx, 8 + 4, 1, data.dual ? 1 : 0);
       break;
 
-    case MENU_METRO:  // метроном, снизу вкл/выкл
+    case MENU_METRO:  // метроном, снизу вкл/выкл. Включён — мигают две точки слева сверху.
       printIcon(&mtrx, 0, 0, 7);
       printDig(&mtrx, 8 + 0, 1, 0);
       printDig(&mtrx, 8 + 4, 1, data.metro ? 1 : 0);
+      if (data.metro && ((millis() / 400) & 1)) {
+        mtrx.dot(0, 0);
+        mtrx.dot(1, 0);
+      }
       break;
   }
   mtrx.update();
@@ -630,6 +634,17 @@ void loop() {
   if (editKind) {
     serviceDualEditor();
     return;
+  }
+
+  // список меню не крутит маятник; мигание только показывает, что метроном включён
+  if (inMenu == MENU_METRO && data.metro) {
+    static uint8_t hintPhase = 0xff;
+    uint8_t phase = (millis() / 400) & 1;
+    if (phase != hintPhase) {
+      hintPhase = phase;
+      mtrx.clear();
+      showMenu(MENU_METRO);
+    }
   }
 
   if (!disp_tmr.state()) {
